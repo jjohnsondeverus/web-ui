@@ -34,11 +34,13 @@ from src.controller.custom_controller import CustomController
 from gradio.themes import Citrus, Default, Glass, Monochrome, Ocean, Origin, Soft, Base
 from src.utils.default_config_settings import default_config, load_config_from_file, save_config_to_file, save_current_config, update_ui_from_config
 from src.utils.utils import update_model_dropdown, get_latest_files, capture_screenshot
+from src.recording.task_recorder import TaskRecorder, BrowserEventHandler
 
 
 # Global variables for persistence
 _global_browser = None
 _global_browser_context = None
+_global_task_recorder = None
 
 # Create the global agent state instance
 _global_agent_state = AgentState()
@@ -589,7 +591,60 @@ async def close_global_browser():
         await _global_browser.close()
         _global_browser = None
 
+async def initialize_browser_for_recording(use_own_browser: bool) -> str:
+    """Initialize browser for human task recording"""
+    global _global_browser, _global_browser_context
+    
+    try:
+        # If browser exists but was created with different settings, close it
+        if _global_browser:
+            await close_global_browser()
+            
+        # Setup browser with recording-appropriate settings
+        window_w = 1280  # Default width
+        window_h = 720   # Default height
+        
+        # Setup browser config
+        browser_config = BrowserConfig(
+            headless=False,  # Always show browser for human interaction
+            disable_security=False,  # Keep security enabled for human browsing
+        )
+        
+        if use_own_browser:
+            # Use user's Chrome if configured
+            browser_config.chrome_instance_path = os.getenv("CHROME_PATH", None)
+            if os.getenv("CHROME_USER_DATA"):
+                browser_config.extra_chromium_args = [
+                    f"--user-data-dir={os.getenv('CHROME_USER_DATA')}"
+                ]
+
+        # Initialize Playwright and browser without context manager
+        playwright = await async_playwright().start()
+        _global_browser = await playwright.chromium.launch(
+            headless=False,
+            args=browser_config.extra_chromium_args if hasattr(browser_config, 'extra_chromium_args') else None
+        )
+
+        # Create browser context
+        _global_browser_context = await _global_browser.new_context(
+            viewport={'width': window_w, 'height': window_h}
+        )
+        
+        # Open a blank page to start
+        page = await _global_browser_context.new_page()
+        await page.goto('about:blank')
+        
+        return "Browser initialized successfully for recording"
+    except Exception as e:
+        logger.error(f"Error initializing browser: {e}")
+        return f"Error initializing browser: {str(e)}"
+
 def create_ui(config, theme_name="Ocean"):
+    global _global_task_recorder
+    
+    # Initialize the task recorder with the same path as other recordings
+    _global_task_recorder = TaskRecorder(save_dir=config['save_recording_path'])
+
     css = """
     .gradio-container {
         max-width: 1200px !important;
@@ -797,6 +852,128 @@ def create_ui(config, theme_name="Ocean"):
                         value="<h1 style='width:80vw; height:50vh'>Waiting for browser session...</h1>",
                         label="Live Browser View",
                 )
+
+            with gr.TabItem("📹 Task Recording", id=8):
+                with gr.Group():
+                    gr.Markdown("""
+                        ## Task Recording
+                        Record browser interactions to create reusable task templates.
+                        The agent can later replay these recorded tasks.
+                    """)
+                    
+                    with gr.Row():
+                        init_browser_btn = gr.Button("🌐 Initialize Browser", variant="secondary")
+                        
+                    with gr.Row():
+                        task_name = gr.Textbox(
+                            label="Task Name",
+                            placeholder="Enter a name for this task...",
+                            info="This name will be used to save and identify the recorded task"
+                        )
+                        
+                    with gr.Row():
+                        start_recording_btn = gr.Button("▶️ Start Recording", variant="primary")
+                        stop_recording_btn = gr.Button("⏹️ Stop Recording", variant="stop")
+                        stop_recording_btn.visible = False
+                        
+                    with gr.Row():
+                        recording_status = gr.Textbox(
+                            label="Status",
+                            value="Not recording",
+                            interactive=False
+                        )
+                        
+                    with gr.Row():
+                        recorded_steps = gr.JSON(
+                            label="Recorded Steps",
+                            value=[],
+                            visible=True
+                        )
+
+                    async def on_init_browser():
+                        # Get browser settings from config
+                        use_own = config.get('use_own_browser', False)
+                        result = await initialize_browser_for_recording(use_own)
+                        return {
+                            recording_status: result,
+                            init_browser_btn: gr.update(interactive=True)
+                        }
+
+                    init_browser_btn.click(
+                        fn=on_init_browser,
+                        outputs=[recording_status, init_browser_btn]
+                    )
+
+                    async def on_start_recording(task_name):
+                        global _global_browser_context, _global_task_recorder
+                        
+                        if not task_name.strip():
+                            return {
+                                recording_status: "Error: Please enter a task name first",
+                                start_recording_btn: gr.update(interactive=True),
+                                stop_recording_btn: gr.update(visible=False),
+                                recorded_steps: []
+                            }
+                        
+                        if not _global_browser_context:
+                            return {
+                                recording_status: "Error: Browser not initialized. Please start the browser first.",
+                                start_recording_btn: gr.update(interactive=True),
+                                stop_recording_btn: gr.update(visible=False),
+                                recorded_steps: []
+                            }
+
+                        try:
+                            _global_task_recorder.start_recording(task_name)
+                            # Attach event handlers to browser context
+                            asyncio.create_task(_global_task_recorder.attach_to_browser(_global_browser_context))
+                            
+                            return {
+                                recording_status: "Recording started...",
+                                start_recording_btn: gr.update(visible=False),
+                                stop_recording_btn: gr.update(visible=True),
+                                recorded_steps: []
+                            }
+                        except Exception as e:
+                            return {
+                                recording_status: f"Error starting recording: {str(e)}",
+                                start_recording_btn: gr.update(interactive=True),
+                                stop_recording_btn: gr.update(visible=False),
+                                recorded_steps: []
+                            }
+
+                    async def on_stop_recording():
+                        global _global_task_recorder
+                        
+                        try:
+                            steps = _global_task_recorder.stop_recording()
+                            filepath = _global_task_recorder.save_recording()
+                            
+                            return {
+                                recording_status: f"Recording saved to {filepath}",
+                                start_recording_btn: gr.update(visible=True),
+                                stop_recording_btn: gr.update(visible=False),
+                                recorded_steps: steps
+                            }
+                        except Exception as e:
+                            return {
+                                recording_status: f"Error saving recording: {str(e)}",
+                                start_recording_btn: gr.update(visible=True),
+                                stop_recording_btn: gr.update(visible=False),
+                                recorded_steps: []
+                            }
+
+                    # Update the click handlers to include recorded_steps output
+                    start_recording_btn.click(
+                        fn=on_start_recording,
+                        inputs=[task_name],
+                        outputs=[recording_status, start_recording_btn, stop_recording_btn, recorded_steps]
+                    )
+                    
+                    stop_recording_btn.click(
+                        fn=on_stop_recording,
+                        outputs=[recording_status, start_recording_btn, stop_recording_btn, recorded_steps]
+                    )
 
             with gr.TabItem("📁 Configuration", id=5):
                 with gr.Group():

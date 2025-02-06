@@ -168,106 +168,90 @@ class TaskRecorder:
             # Wait for page to be ready
             await page.wait_for_load_state('domcontentloaded')
 
-            # Add debug logging to see what events are actually happening
-            await page.evaluate("""() => {
-                const observer = new MutationObserver((mutations) => {
-                    console.log('DOM changed:', mutations.length, 'mutations');
-                });
-                observer.observe(document.body, { 
-                    childList: true, 
-                    subtree: true, 
-                    attributes: true 
-                });
-                
-                // Debug click events
-                document.addEventListener('click', (e) => {
-                    console.log('Raw click event:', {
-                        target: e.target.tagName,
-                        id: e.target.id,
-                        type: e.type,
-                        x: e.clientX,
-                        y: e.clientY
-                    });
-                }, true);
-                
-                // Debug input events
-                document.addEventListener('input', (e) => {
-                    console.log('Raw input event:', {
-                        target: e.target.tagName,
-                        id: e.target.id,
-                        type: e.type,
-                        value: e.target.value
-                    });
-                }, true);
-            }""")
+            # First expose the functions
+            await page.expose_function("__recordClick", 
+                lambda click_info: asyncio.create_task(self.event_handler.handle_click(page, click_info)))
+            await page.expose_function("__recordInput", 
+                lambda input_info: asyncio.create_task(self.event_handler.handle_input(page, input_info)))
 
-            # Add click listener with debug logging
-            async def handle_click(click_info):
-                logger.info("Playwright click event received")  # Debug log
-                try:
-                    element = click_info.element
-                    if not element:
-                        logger.info("No element in click event")  # Debug log
-                        return
+            # Add navigation listener to reinject script after each navigation
+            async def handle_navigation():
+                logger.info("Reinjecting event listeners after navigation")
+                await inject_listeners()
+
+            # Define the injection function
+            async def inject_listeners():
+                await page.evaluate("""() => {
+                    // Remove old listeners if they exist
+                    window.__recorderInitialized = false;
+                    
+                    // Only inject once per page
+                    if (!window.__recorderInitialized) {
+                        window.__recorderInitialized = true;
+                        console.log('Initializing event listeners');
                         
-                    # Get element properties
-                    props = await element.evaluate("""(el) => ({
-                        tagName: el.tagName.toLowerCase(),
-                        id: el.id,
-                        className: el.className,
-                        textContent: el.textContent?.trim(),
-                        href: el.href,
-                        type: el.type,
-                        name: el.name
-                    })""")
-                    
-                    logger.info(f"Click detected on: {props}")
-                    
-                    await self.event_handler.handle_click(page, {
-                        'element': props,
-                        'x': click_info.position["x"] if hasattr(click_info, "position") else 0,
-                        'y': click_info.position["y"] if hasattr(click_info, "position") else 0
-                    })
-                except Exception as e:
-                    logger.error(f"Error handling click: {e}", exc_info=True)  # Added exc_info
+                        // Click listener
+                        document.addEventListener('click', event => {
+                            const element = event.target;
+                            const clickInfo = {
+                                element: {
+                                    tagName: element.tagName.toLowerCase(),
+                                    id: element.id || '',
+                                    className: element.className || '',
+                                    textContent: element.textContent?.trim() || '',
+                                    href: element.href || '',
+                                    type: element.type || '',
+                                    name: element.name || ''
+                                },
+                                x: event.clientX,
+                                y: event.clientY
+                            };
+                            console.log('Sending click event:', clickInfo);
+                            window.__recordClick(clickInfo);
+                        }, true);
+                        
+                        // Enhanced input capture
+                        const captureInput = (event) => {
+                            const element = event.target;
+                            const inputInfo = {
+                                element: {
+                                    tagName: element.tagName.toLowerCase(),
+                                    id: element.id || '',
+                                    type: element.type || '',
+                                    name: element.name || ''
+                                },
+                                value: element.type === 'password' ? '********' : element.value
+                            };
+                            console.log('Sending input event:', inputInfo);
+                            window.__recordInput(inputInfo);
+                        };
 
-            # Add input listener with debug logging
-            async def handle_input(element_handle):
-                logger.info("Playwright input event received")  # Debug log
-                try:
-                    props = await element_handle.evaluate("""(el) => ({
-                        tagName: el.tagName.toLowerCase(),
-                        id: el.id,
-                        type: el.type,
-                        name: el.name,
-                        value: el.type === 'password' ? '********' : el.value
-                    })""")
-                    
-                    logger.info(f"Input detected on: {props}")
-                    
-                    await self.event_handler.handle_input(page, {
-                        'element': props,
-                        'value': props['value']
-                    })
-                except Exception as e:
-                    logger.error(f"Error handling input: {e}", exc_info=True)  # Added exc_info
+                        // Listen for all possible input events
+                        document.addEventListener('input', captureInput, true);
+                        document.addEventListener('change', captureInput, true);
+                        document.addEventListener('keyup', (e) => {
+                            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+                                captureInput(e);
+                            }
+                        }, true);
+                        
+                        console.log('Event listeners successfully initialized');
+                    }
+                }""")
 
-            # Add Playwright event listeners
-            page.on("click", handle_click)
-            page.on("input", handle_input)
+            # Initial injection
+            await inject_listeners()
             
-            # Add page lifecycle events with debug logging
+            # Add page lifecycle events
+            page.on('load', lambda: asyncio.create_task(handle_navigation()))
+            page.on('domcontentloaded', lambda: asyncio.create_task(self.event_handler.handle_navigation(page)))
             page.on('console', lambda msg: logger.info(f"Browser console: {msg.text}"))
             page.on('pageerror', lambda err: logger.error(f"Browser error: {err}"))
-            page.on('load', lambda: logger.info(f"Page loaded: {page.url}"))
-            page.on('domcontentloaded', lambda: 
-                asyncio.create_task(self.event_handler.handle_navigation(page))
-            )
             
             logger.info("Page recording setup complete")
             
         except Exception as e:
-            logger.error(f"Error setting up page recording: {e}", exc_info=True)  # Added exc_info
+            logger.error(f"Error setting up page recording: {e}", exc_info=True)
 
     async def _handle_page_event(self, event_type: str, data: Dict, page: Page):
         """Handle events from the page"""

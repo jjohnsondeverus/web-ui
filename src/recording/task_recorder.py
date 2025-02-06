@@ -49,6 +49,10 @@ class BrowserEventHandler:
     async def handle_input(self, page: Page, event):
         """Handle input events"""
         try:
+            # Skip empty input events
+            if not event.get('value', '').strip():
+                return
+            
             element_info = event['element']
             
             # Build selector for input field
@@ -210,30 +214,62 @@ class TaskRecorder:
                             window.__recordClick(clickInfo);
                         }, true);
                         
-                        // Enhanced input capture
+                        // Debounced input capture with focus on final values
+                        let inputTimeout;
+                        let lastRecordedValue = '';
+                        let focusedElement = null;
+                        
                         const captureInput = (event) => {
                             const element = event.target;
-                            const inputInfo = {
-                                element: {
-                                    tagName: element.tagName.toLowerCase(),
-                                    id: element.id || '',
-                                    type: element.type || '',
-                                    name: element.name || ''
-                                },
-                                value: element.type === 'password' ? '********' : element.value
-                            };
-                            console.log('Sending input event:', inputInfo);
-                            window.__recordInput(inputInfo);
+                            
+                            // Clear any pending timeout
+                            if (inputTimeout) {
+                                clearTimeout(inputTimeout);
+                            }
+                            
+                            // Set new timeout
+                            inputTimeout = setTimeout(() => {
+                                const value = element.type === 'password' ? '********' : element.value;
+                                
+                                // Skip empty or unchanged values
+                                if (!value.trim() || value === lastRecordedValue) {
+                                    return;
+                                }
+                                
+                                // Only record if:
+                                // 1. Element lost focus (complete input), or
+                                // 2. User paused typing for 1 second
+                                if (element !== focusedElement || element.value.length > 3) {
+                                    lastRecordedValue = value;
+                                    
+                                    const inputInfo = {
+                                        element: {
+                                            tagName: element.tagName.toLowerCase(),
+                                            id: element.id || '',
+                                            type: element.type || '',
+                                            name: element.name || ''
+                                        },
+                                        value: value
+                                    };
+                                    console.log('Sending input event:', inputInfo);
+                                    window.__recordInput(inputInfo);
+                                }
+                            }, 1000); // Increased to 1 second for better completion detection
                         };
 
-                        // Listen for all possible input events
+                        // Track focused element
+                        document.addEventListener('focusin', (e) => {
+                            focusedElement = e.target;
+                        });
+                        
+                        document.addEventListener('focusout', (e) => {
+                            focusedElement = null;
+                            // Capture final value on blur
+                            captureInput(e);
+                        });
+
+                        // Listen for input events
                         document.addEventListener('input', captureInput, true);
-                        document.addEventListener('change', captureInput, true);
-                        document.addEventListener('keyup', (e) => {
-                            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
-                                captureInput(e);
-                            }
-                        }, true);
                         
                         console.log('Event listeners successfully initialized');
                     }

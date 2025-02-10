@@ -1,37 +1,54 @@
 import asyncio
-import pdb
-
-from playwright.async_api import Browser as PlaywrightBrowser
-from playwright.async_api import (
-    BrowserContext as PlaywrightBrowserContext,
-)
-from playwright.async_api import (
-    Playwright,
-    async_playwright,
-)
-from browser_use.browser.browser import Browser
-from browser_use.browser.context import BrowserContext, BrowserContextConfig
-from playwright.async_api import BrowserContext as PlaywrightBrowserContext
 import logging
+import os
+from typing import Optional, Union, Dict, Any
+
+from browser_use.browser.browser import Browser, BrowserConfig
+from browser_use.browser.context import BrowserContext, BrowserContextConfig
+from playwright.async_api import Browser as PlaywrightBrowser
+from playwright.async_api import BrowserContext as PlaywrightBrowserContext
+from playwright.async_api import Playwright, ViewportSize
+from playwright.async_api import async_playwright
 
 from .custom_context import CustomBrowserContext
 
 logger = logging.getLogger(__name__)
 
 class CustomBrowser(Browser):
+    def __init__(self, config: Optional[BrowserConfig] = None):
+        super().__init__(config=config or BrowserConfig())
+        self._browser: Optional[PlaywrightBrowser] = None
 
     async def new_context(
         self,
         config: BrowserContextConfig = BrowserContextConfig()
     ) -> CustomBrowserContext:
-        return CustomBrowserContext(config=config, browser=self)
-    
+        if not self._browser:
+            # Initialize browser if not already done
+            playwright = await async_playwright().start()
+            self._browser = await playwright.chromium.launch(
+                headless=self.config.headless,
+                args=self.config.extra_chromium_args
+            )
+            
+        # Create the context with proper viewport settings
+        context = CustomBrowserContext(browser=self, config=config)
+        context._context = await self._browser.new_context(
+            viewport={'width': config.browser_window_size['width'], 'height': config.browser_window_size['height']} if config.browser_window_size else None
+        )
+        return context
+
+    async def close(self):
+        """Close the browser and clean up resources"""
+        if self._browser:
+            await self._browser.close()
+            self._browser = None
+
     async def _setup_browser_with_instance(self, playwright: Playwright) -> PlaywrightBrowser:
         """Sets up and returns a Playwright Browser instance with anti-detection measures."""
         if not self.config.chrome_instance_path:
             raise ValueError('Chrome instance path is required')
         import subprocess
-
         import requests
 
         try:
@@ -39,11 +56,11 @@ class CustomBrowser(Browser):
             response = requests.get('http://localhost:9222/json/version', timeout=2)
             if response.status_code == 200:
                 logger.info('Reusing existing Chrome instance')
-                browser = await playwright.chromium.connect_over_cdp(
+                self._browser = await playwright.chromium.connect_over_cdp(
                     endpoint_url='http://localhost:9222',
                     timeout=20000,  # 20 second timeout for connection
                 )
-                return browser
+                return self._browser
         except requests.ConnectionError:
             logger.debug('No existing Chrome instance found, starting a new one')
 
@@ -69,13 +86,13 @@ class CustomBrowser(Browser):
 
         # Attempt to connect again after starting a new instance
         try:
-            browser = await playwright.chromium.connect_over_cdp(
+            self._browser = await playwright.chromium.connect_over_cdp(
                 endpoint_url='http://localhost:9222',
                 timeout=20000,  # 20 second timeout for connection
             )
-            return browser
+            return self._browser
         except Exception as e:
             logger.error(f'Failed to start a new Chrome instance.: {str(e)}')
             raise RuntimeError(
-                ' To start chrome in Debug mode, you need to close all existing Chrome instances and try again otherwise we can not connect to the instance.'
+                'To start chrome in Debug mode, you need to close all existing Chrome instances and try again otherwise we can not connect to the instance.'
             )

@@ -1,5 +1,7 @@
 import pdb
 import logging
+import json
+import datetime
 
 from dotenv import load_dotenv
 
@@ -18,29 +20,31 @@ from browser_use.agent.service import Agent
 from playwright.async_api import async_playwright
 from browser_use.browser.browser import Browser, BrowserConfig
 from browser_use.browser.context import (
+    BrowserContext,
     BrowserContextConfig,
     BrowserContextWindowSize,
 )
 from langchain_ollama import ChatOllama
-from playwright.async_api import async_playwright
 from src.utils.agent_state import AgentState
 
 from src.utils import utils
 from src.agent.custom_agent import CustomAgent
 from src.browser.custom_browser import CustomBrowser
-from src.agent.custom_prompts import CustomSystemPrompt, CustomAgentMessagePrompt
-from src.browser.custom_context import BrowserContextConfig, CustomBrowserContext
+from src.browser.custom_context import CustomBrowserContext
 from src.controller.custom_controller import CustomController
 from gradio.themes import Citrus, Default, Glass, Monochrome, Ocean, Origin, Soft, Base
 from src.utils.default_config_settings import default_config, load_config_from_file, save_config_to_file, save_current_config, update_ui_from_config
 from src.utils.utils import update_model_dropdown, get_latest_files, capture_screenshot
 from src.recording.task_recorder import TaskRecorder, BrowserEventHandler
 
+from browser_use.browser.browser import BrowserConfig
+from browser_use.browser.context import BrowserContextConfig
 
 # Global variables for persistence
 _global_browser = None
 _global_browser_context = None
 _global_task_recorder = None
+_global_playwright = None
 
 # Create the global agent state instance
 _global_agent_state = AgentState()
@@ -94,29 +98,61 @@ async def run_browser_agent(
         max_steps,
         use_vision,
         max_actions_per_step,
-        tool_calling_method
+        tool_calling_method,
+        use_recorded_task,
+        recorded_task_name
 ):
-    global _global_agent_state
-    _global_agent_state.clear_stop()  # Clear any previous stop requests
-
     try:
-        # Disable recording if the checkbox is unchecked
-        if not enable_recording:
-            save_recording_path = None
+        global _global_browser, _global_browser_context, _global_playwright, _global_agent_state
+        
+        # Clear any previous stop request
+        _global_agent_state.clear_stop()
 
-        # Ensure the recording directory exists if recording is enabled
-        if save_recording_path:
-            os.makedirs(save_recording_path, exist_ok=True)
-
-        # Get the list of existing videos before the agent runs
-        existing_videos = set()
-        if save_recording_path:
-            existing_videos = set(
-                glob.glob(os.path.join(save_recording_path, "*.[mM][pP]4"))
-                + glob.glob(os.path.join(save_recording_path, "*.[wW][eE][bB][mM]"))
+        # Close any existing browser sessions
+        await close_global_browser()
+            
+        # Initialize Playwright
+        _global_playwright = await async_playwright().start()
+        
+        # Create browser instance with proper initialization
+        _global_browser = CustomBrowser()
+        browser_config = BrowserConfig(
+            headless=headless,
+            disable_security=disable_security,
+            chrome_instance_path=os.getenv("CHROME_PATH") if use_own_browser else None
+        )
+        
+        # Set config before launching
+        _global_browser.config = browser_config
+        
+        # Launch browser based on settings
+        if use_own_browser and browser_config.chrome_instance_path:
+            # Use custom Chrome instance
+            playwright_browser = await _global_browser._setup_browser_with_instance(_global_playwright)
+        else:
+            # Use standard browser launch
+            playwright_browser = await _global_playwright.chromium.launch(
+                headless=headless,
+                args=['--disable-web-security'] if disable_security else None
             )
+            
+        # Set the browser instance
+        _global_browser._browser = playwright_browser
 
-        # Run the agent
+        # Create context with proper window size configuration
+        context_config = BrowserContextConfig()
+        context_config.no_viewport = False
+        context_config.browser_window_size = BrowserContextWindowSize(
+            width=window_w,
+            height=window_h
+        )
+        
+        _global_browser_context = await _global_browser.new_context(config=context_config)
+
+        # Create a page in the context
+        await _global_browser_context.new_page()
+
+        # Create agent with correct arguments
         llm = utils.get_llm_model(
             provider=llm_provider,
             model_name=llm_model_name,
@@ -124,84 +160,92 @@ async def run_browser_agent(
             base_url=llm_base_url,
             api_key=llm_api_key,
         )
-        if agent_type == "org":
-            final_result, errors, model_actions, model_thoughts, trace_file, history_file = await run_org_agent(
-                llm=llm,
-                use_own_browser=use_own_browser,
-                keep_browser_open=keep_browser_open,
-                headless=headless,
-                disable_security=disable_security,
-                window_w=window_w,
-                window_h=window_h,
-                save_recording_path=save_recording_path,
-                save_agent_history_path=save_agent_history_path,
-                save_trace_path=save_trace_path,
-                task=task,
-                max_steps=max_steps,
-                use_vision=use_vision,
-                max_actions_per_step=max_actions_per_step,
-                tool_calling_method=tool_calling_method
-            )
-        elif agent_type == "custom":
-            final_result, errors, model_actions, model_thoughts, trace_file, history_file = await run_custom_agent(
-                llm=llm,
-                use_own_browser=use_own_browser,
-                keep_browser_open=keep_browser_open,
-                headless=headless,
-                disable_security=disable_security,
-                window_w=window_w,
-                window_h=window_h,
-                save_recording_path=save_recording_path,
-                save_agent_history_path=save_agent_history_path,
-                save_trace_path=save_trace_path,
+
+        # Create agent based on type
+        if agent_type == "custom":
+            from src.agent.custom_prompts import CustomSystemPrompt, CustomAgentMessagePrompt
+            from src.controller.custom_controller import CustomController
+            
+            controller = CustomController()
+            
+            # Load recorded task if specified
+            if use_recorded_task and recorded_task_name:
+                task_file = os.path.join("tmp", "record_videos", recorded_task_name)
+                if os.path.exists(task_file):
+                    with open(task_file, 'r') as f:
+                        recorded_task_data = json.load(f)
+                        task = f"Replay the following recorded task: {recorded_task_data.get('task_name', 'Unnamed Task')}"
+                        add_infos = f"Follow these recorded steps: {json.dumps(recorded_task_data.get('steps', []))}"
+            
+            agent = CustomAgent(
                 task=task,
                 add_infos=add_infos,
-                max_steps=max_steps,
+                llm=llm,
+                browser=_global_browser,
+                browser_context=_global_browser_context,
+                controller=controller,
+                system_prompt_class=CustomSystemPrompt,
+                agent_prompt_class=CustomAgentMessagePrompt,
                 use_vision=use_vision,
-                max_actions_per_step=max_actions_per_step,
-                tool_calling_method=tool_calling_method
+                max_actions_per_step=max_actions_per_step
             )
         else:
-            raise ValueError(f"Invalid agent type: {agent_type}")
-
-        # Get the list of videos after the agent runs (if recording is enabled)
-        latest_video = None
-        if save_recording_path:
-            new_videos = set(
-                glob.glob(os.path.join(save_recording_path, "*.[mM][pP]4"))
-                + glob.glob(os.path.join(save_recording_path, "*.[wW][eE][bB][mM]"))
+            agent = Agent(
+                task=task,
+                llm=llm,
+                browser_context=_global_browser_context,
+                use_vision=use_vision,
+                tool_calling_method=tool_calling_method
             )
-            if new_videos - existing_videos:
-                latest_video = list(new_videos - existing_videos)[0]  # Get the first new video
+
+        # Run the agent
+        history = await agent.run(max_steps=max_steps)
+        
+        # Save agent history if path provided
+        if save_agent_history_path:
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(save_agent_history_path), exist_ok=True)
+            # Generate a unique filename using timestamp
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            history_file = os.path.join(save_agent_history_path, f"agent_history_{timestamp}.json")
+            # Save history data
+            history_data = {
+                "final_result": history.final_result(),
+                "errors": history.errors(),
+                "model_actions": history.model_actions(),
+                "model_thoughts": history.model_thoughts()
+            }
+            with open(history_file, 'w') as f:
+                json.dump(history_data, f, indent=2)
+
+        # Handle cleanup based on persistence configuration
+        if not keep_browser_open:
+            await close_global_browser()
 
         return (
-            final_result,
-            errors,
-            model_actions,
-            model_thoughts,
-            latest_video,
-            trace_file,
-            history_file,
-            gr.update(value="Stop", interactive=True),  # Re-enable stop button
-            gr.update(interactive=True)    # Re-enable run button
+            history.final_result(),
+            history.errors(),
+            history.model_actions(),
+            history.model_thoughts(),
+            gr.update(interactive=True),    # Re-enable run button
+            gr.update(interactive=True)     # Re-enable stop button
         )
 
     except Exception as e:
+        logger.error(f"Error in run_browser_agent: {e}")
         import traceback
-        traceback.print_exc()
-        errors = str(e) + "\n" + traceback.format_exc()
-        return (
-            '',                                         # final_result
-            errors,                                     # errors
-            '',                                         # model_actions
-            '',                                         # model_thoughts
-            None,                                       # latest_video
-            None,                                       # history_file
-            None,                                       # trace_file
-            gr.update(value="Stop", interactive=True),  # Re-enable stop button
-            gr.update(interactive=True)    # Re-enable run button
-        )
+        errors = f"Error: {str(e)}\n{traceback.format_exc()}"
+        return '', errors, '', '', None, None
+    finally:
+        # Handle cleanup based on persistence configuration
+        if not keep_browser_open:
+            if _global_browser_context:
+                await _global_browser_context.close()
+                _global_browser_context = None
 
+            if _global_browser:
+                await _global_browser.close()
+                _global_browser = None
 
 async def run_org_agent(
         llm,
@@ -423,7 +467,9 @@ async def run_with_stream(
     max_steps,
     use_vision,
     max_actions_per_step,
-    tool_calling_method
+    tool_calling_method,
+    use_recorded_task,
+    recorded_task_dropdown
 ):
     global _global_agent_state
     stream_vw = 80
@@ -451,7 +497,9 @@ async def run_with_stream(
             max_steps=max_steps,
             use_vision=use_vision,
             max_actions_per_step=max_actions_per_step,
-            tool_calling_method=tool_calling_method
+            tool_calling_method=tool_calling_method,
+            use_recorded_task=use_recorded_task,
+            recorded_task_name=recorded_task_dropdown
         )
         # Add HTML content at the start of the result array
         html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Using browser...</h1>"
@@ -483,7 +531,9 @@ async def run_with_stream(
                     max_steps=max_steps,
                     use_vision=use_vision,
                     max_actions_per_step=max_actions_per_step,
-                    tool_calling_method=tool_calling_method
+                    tool_calling_method=tool_calling_method,
+                    use_recorded_task=use_recorded_task,
+                    recorded_task_name=recorded_task_dropdown
                 )
             )
 
@@ -581,19 +631,37 @@ theme_map = {
 }
 
 async def close_global_browser():
-    global _global_browser, _global_browser_context
+    """Ensure proper cleanup of browser resources"""
+    global _global_browser, _global_browser_context, _global_playwright
+    
+    try:
+        if _global_browser_context:
+            try:
+                await _global_browser_context.close()
+            except Exception as e:
+                logger.error(f"Error closing browser context: {e}")
+            _global_browser_context = None
 
-    if _global_browser_context:
-        await _global_browser_context.close()
-        _global_browser_context = None
-
-    if _global_browser:
-        await _global_browser.close()
-        _global_browser = None
+        if _global_browser:
+            try:
+                await _global_browser.close()
+            except Exception as e:
+                logger.error(f"Error closing browser: {e}")
+            _global_browser = None
+            
+        if _global_playwright:
+            try:
+                await _global_playwright.stop()
+            except Exception as e:
+                logger.error(f"Error stopping playwright: {e}")
+            _global_playwright = None
+            
+    except Exception as e:
+        logger.error(f"Error in close_global_browser: {e}")
 
 async def initialize_browser_for_recording(use_own_browser: bool) -> str:
     """Initialize browser for human task recording"""
-    global _global_browser, _global_browser_context
+    global _global_browser, _global_browser_context, _global_playwright
     
     try:
         # If browser exists but was created with different settings, close it
@@ -605,42 +673,72 @@ async def initialize_browser_for_recording(use_own_browser: bool) -> str:
         window_h = 720   # Default height
         
         # Setup browser config
+        extra_chromium_args = []
+        if use_own_browser:
+            chrome_path = os.getenv("CHROME_PATH", None)
+            if chrome_path == "":
+                chrome_path = None
+            chrome_user_data = os.getenv("CHROME_USER_DATA", None)
+            if chrome_user_data:
+                extra_chromium_args.append(f"--user-data-dir={chrome_user_data}")
+            extra_chromium_args.append(f"--window-size={window_w},{window_h}")
+        
         browser_config = BrowserConfig(
             headless=False,  # Always show browser for human interaction
             disable_security=False,  # Keep security enabled for human browsing
-        )
-        
-        if use_own_browser:
-            # Use user's Chrome if configured
-            browser_config.chrome_instance_path = os.getenv("CHROME_PATH", None)
-            if os.getenv("CHROME_USER_DATA"):
-                browser_config.extra_chromium_args = [
-                    f"--user-data-dir={os.getenv('CHROME_USER_DATA')}"
-                ]
-
-        # Initialize Playwright and browser without context manager
-        playwright = await async_playwright().start()
-        _global_browser = await playwright.chromium.launch(
-            headless=False,
-            args=browser_config.extra_chromium_args if hasattr(browser_config, 'extra_chromium_args') else None
+            chrome_instance_path=chrome_path if use_own_browser else None,
+            extra_chromium_args=extra_chromium_args
         )
 
-        # Create browser context
-        _global_browser_context = await _global_browser.new_context(
-            viewport={'width': window_w, 'height': window_h}
+        # Initialize Playwright
+        _global_playwright = await async_playwright().start()
+        
+        # Create browser instance
+        _global_browser = CustomBrowser(config=browser_config)
+        
+        # Create context with proper window size configuration
+        context_config = BrowserContextConfig()
+        context_config.no_viewport = False
+        context_config.browser_window_size = BrowserContextWindowSize(
+            width=window_w,
+            height=window_h
         )
         
-        # Open a blank page to start
-        page = await _global_browser_context.new_page()
-        await page.goto('about:blank')
+        _global_browser_context = await _global_browser.new_context(config=context_config)
+
+        # Create initial page
+        await _global_browser_context.new_page()
         
-        return "Browser initialized successfully for recording"
+        return "Browser initialized successfully"
+        
     except Exception as e:
         logger.error(f"Error initializing browser: {e}")
         return f"Error initializing browser: {str(e)}"
 
+# Modify the utility function to just return the list
+def get_saved_tasks():
+    """List all saved task recordings"""
+    tasks_dir = os.path.join("tmp", "record_videos")
+    if not os.path.exists(tasks_dir):
+        return []
+    
+    tasks = []
+    for filename in os.listdir(tasks_dir):
+        if filename.endswith('.json'):
+            tasks.append(filename)
+    return tasks
+
+# Add this near the top with other utility functions
+def update_task_dropdowns():
+    """Update both task dropdowns with current list of tasks"""
+    tasks = get_saved_tasks()
+    return {
+        saved_tasks_dropdown: gr.update(choices=tasks),
+        recorded_task_dropdown: gr.update(choices=tasks)
+    }
+
 def create_ui(config, theme_name="Ocean"):
-    global _global_task_recorder
+    global _global_task_recorder, saved_tasks_dropdown, recorded_task_dropdown
     
     # Initialize the task recorder with the same path as other recordings
     _global_task_recorder = TaskRecorder(save_dir=config['save_recording_path'])
@@ -829,13 +927,54 @@ def create_ui(config, theme_name="Ocean"):
                     )
 
             with gr.TabItem("🤖 Run Agent", id=4):
-                task = gr.Textbox(
-                    label="Task Description",
-                    lines=4,
-                    placeholder="Enter your task here...",
-                    value=config['task'],
-                    info="Describe what you want the agent to do",
-                )
+                with gr.Group():
+                    with gr.Row():
+                        use_recorded_task = gr.Checkbox(
+                            label="Use Recorded Task",
+                            value=False,
+                            info="Execute a previously recorded task"
+                        )
+                        recorded_task_dropdown = gr.Dropdown(
+                            label="Select Task",
+                            choices=[],
+                            interactive=True,
+                            visible=False
+                        )
+
+                    task = gr.Textbox(
+                        label="Task Description",
+                        lines=4,
+                        placeholder="Enter your task here...",
+                        value=config['task'],
+                        info="Describe what you want the agent to do",
+                    )
+
+                    def update_task_inputs(use_recorded: bool):
+                        if use_recorded:
+                            return {
+                                recorded_task_dropdown: gr.update(visible=True),
+                                task: gr.update(
+                                    interactive=False,
+                                    placeholder="Task will be loaded from recording...",
+                                    value=""
+                                )
+                            }
+                        else:
+                            return {
+                                recorded_task_dropdown: gr.update(visible=False),
+                                task: gr.update(
+                                    interactive=True,
+                                    placeholder="Enter your task here...",
+                                    value=config['task']
+                                )
+                            }
+
+                    use_recorded_task.change(
+                        fn=update_task_inputs,
+                        inputs=[use_recorded_task],
+                        outputs=[recorded_task_dropdown, task]
+                    )
+
                 add_infos = gr.Textbox(
                     label="Additional Information",
                     lines=3,
@@ -889,6 +1028,19 @@ def create_ui(config, theme_name="Ocean"):
                             value=[],
                             visible=True
                         )
+
+                    with gr.Row():
+                        saved_tasks_dropdown = gr.Dropdown(
+                            label="Saved Tasks",
+                            choices=[], # Will be populated on load
+                            info="Select a previously recorded task",
+                            interactive=True
+                        )
+                        refresh_tasks_btn = gr.Button("🔄 Refresh Tasks", variant="secondary")
+                        
+                    with gr.Row():
+                        load_task_btn = gr.Button("📂 Load Task", variant="secondary")
+                        delete_task_btn = gr.Button("🗑️ Delete Task", variant="secondary", visible=True)
 
                     async def on_init_browser():
                         # Get browser settings from config
@@ -949,11 +1101,15 @@ def create_ui(config, theme_name="Ocean"):
                             steps = _global_task_recorder.stop_recording()
                             filepath = _global_task_recorder.save_recording()
                             
+                            # After saving the recording, update both dropdowns
+                            tasks = get_saved_tasks()
                             return {
-                                recording_status: f"Recording saved to {filepath}",
+                                recording_status: "Recording stopped and saved",
                                 start_recording_btn: gr.update(visible=True),
                                 stop_recording_btn: gr.update(visible=False),
-                                recorded_steps: steps
+                                recorded_steps: steps,
+                                saved_tasks_dropdown: gr.update(choices=tasks),
+                                recorded_task_dropdown: gr.update(choices=tasks)
                             }
                         except Exception as e:
                             return {
@@ -970,9 +1126,23 @@ def create_ui(config, theme_name="Ocean"):
                         outputs=[recording_status, start_recording_btn, stop_recording_btn, recorded_steps]
                     )
                     
+                    # Update the stop_recording_btn click handler to include both dropdowns in outputs
                     stop_recording_btn.click(
                         fn=on_stop_recording,
-                        outputs=[recording_status, start_recording_btn, stop_recording_btn, recorded_steps]
+                        outputs=[
+                            recording_status,
+                            start_recording_btn,
+                            stop_recording_btn,
+                            recorded_steps,
+                            saved_tasks_dropdown,     # Add these two
+                            recorded_task_dropdown    # dropdown outputs
+                        ]
+                    )
+
+                    # Wire up the refresh button click handler
+                    refresh_tasks_btn.click(
+                        fn=update_task_dropdowns,
+                        outputs=[saved_tasks_dropdown, recorded_task_dropdown]
                     )
 
             with gr.TabItem("📁 Configuration", id=5):
@@ -1055,23 +1225,24 @@ def create_ui(config, theme_name="Ocean"):
                 # Run button click handler
                 run_button.click(
                     fn=run_with_stream,
-                        inputs=[
-                            agent_type, llm_provider, llm_model_name, llm_temperature, llm_base_url, llm_api_key,
-                            use_own_browser, keep_browser_open, headless, disable_security, window_w, window_h,
-                            save_recording_path, save_agent_history_path, save_trace_path,  # Include the new path
-                            enable_recording, task, add_infos, max_steps, use_vision, max_actions_per_step, tool_calling_method
-                        ],
+                    inputs=[
+                        agent_type, llm_provider, llm_model_name, llm_temperature, llm_base_url, llm_api_key,
+                        use_own_browser, keep_browser_open, headless, disable_security, window_w, window_h,
+                        save_recording_path, save_agent_history_path, save_trace_path,
+                        enable_recording, task, add_infos, max_steps, use_vision, max_actions_per_step, tool_calling_method,
+                        use_recorded_task, recorded_task_dropdown
+                    ],
                     outputs=[
-                        browser_view,           # Browser view
-                        final_result_output,    # Final result
-                        errors_output,          # Errors
-                        model_actions_output,   # Model actions
-                        model_thoughts_output,  # Model thoughts
-                        recording_display,      # Latest recording
-                        trace_file,             # Trace file
-                        agent_history_file,     # Agent history file
-                        stop_button,            # Stop button
-                        run_button              # Run button
+                        browser_view,           
+                        final_result_output,    
+                        errors_output,          
+                        model_actions_output,   
+                        model_thoughts_output,  
+                        recording_display,      
+                        trace_file,             
+                        agent_history_file,     
+                        stop_button,            
+                        run_button              
                     ],
                 )
 
@@ -1126,9 +1297,16 @@ def create_ui(config, theme_name="Ocean"):
         use_own_browser.change(fn=close_global_browser)
         keep_browser_open.change(fn=close_global_browser)
 
+    # Initial population of dropdowns
+    initial_tasks = get_saved_tasks()
+    saved_tasks_dropdown.choices = initial_tasks
+    recorded_task_dropdown.choices = initial_tasks
+
     return demo
 
 def main():
+    global saved_tasks_dropdown, recorded_task_dropdown
+    
     parser = argparse.ArgumentParser(description="Gradio UI for Browser Agent")
     parser.add_argument("--ip", type=str, default="127.0.0.1", help="IP address to bind to")
     parser.add_argument("--port", type=int, default=7788, help="Port to listen on")
@@ -1139,6 +1317,7 @@ def main():
     config_dict = default_config()
 
     demo = create_ui(config_dict, theme_name=args.theme)
+    
     demo.launch(server_name=args.ip, server_port=args.port)
 
 if __name__ == '__main__':

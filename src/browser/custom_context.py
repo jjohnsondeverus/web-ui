@@ -284,6 +284,8 @@ class CustomBrowserContext(BrowserContext):
         if not self._context:
             raise RuntimeError("Browser context not initialized")
         self._page = await self._context.new_page()
+        # Patch the page's context to include the custom get_state method
+        self._page.context.get_state = self.get_state
         return self._page
 
     async def close(self):

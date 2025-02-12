@@ -1,3 +1,4 @@
+from __future__ import annotations
 import pdb
 import logging
 import json
@@ -39,6 +40,8 @@ from src.recording.task_recorder import TaskRecorder, BrowserEventHandler
 
 from browser_use.browser.browser import BrowserConfig
 from browser_use.browser.context import BrowserContextConfig
+
+from src.agent.custom_prompts import CustomSystemPrompt, CustomAgentMessagePrompt
 
 # Global variables for persistence
 _global_browser = None
@@ -212,30 +215,34 @@ async def run_browser_agent(
             history_data = {
                 "final_result": history.final_result(),
                 "errors": history.errors(),
-                "model_actions": history.model_actions(),
-                "model_thoughts": history.model_thoughts()
+                "model_actions": [action.model_dump() if hasattr(action, 'model_dump') else str(action) for action in history.model_actions()],  # type: ignore
+                "model_thoughts": history.model_thoughts(),
+                "agent_config": agent.to_dict() if hasattr(agent, 'to_dict') else None,  # type: ignore
             }
             with open(history_file, 'w') as f:
-                json.dump(history_data, f, indent=2)
+                json.dump(history_data, f, indent=2, default=str)
 
         # Handle cleanup based on persistence configuration
         if not keep_browser_open:
             await close_global_browser()
 
         return (
-            history.final_result(),
-            history.errors(),
-            history.model_actions(),
-            history.model_thoughts(),
-            gr.update(interactive=True),    # Re-enable run button
-            gr.update(interactive=True)     # Re-enable stop button
+            history.final_result(),       # final_result
+            history.errors(),             # errors
+            history.model_actions(),      # model_actions
+            history.model_thoughts(),     # model_thoughts
+            None,                         # recording_display (none by default)
+            None,                         # trace_file (none by default)
+            None,                         # agent_history_file (none by default)
+            gr.update(value="Stop", interactive=True),  # stop_button
+            gr.update(interactive=True)                 # run_button
         )
 
     except Exception as e:
         logger.error(f"Error in run_browser_agent: {e}")
         import traceback
         errors = f"Error: {str(e)}\n{traceback.format_exc()}"
-        return '', errors, '', '', None, None
+        return '', errors, '', '', None, None, None, None, None
     finally:
         # Handle cleanup based on persistence configuration
         if not keep_browser_open:
@@ -503,7 +510,18 @@ async def run_with_stream(
         )
         # Add HTML content at the start of the result array
         html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Using browser...</h1>"
-        yield [html_content] + list(result)
+        yield [
+            html_content,                # browser_view
+            result[0],                   # final_result_output
+            result[1],                   # errors_output
+            result[2],                   # model_actions_output
+            result[3],                   # model_thoughts_output
+            result[4],                   # recording_display
+            result[5],                   # trace_file
+            result[6],                   # agent_history_file
+            result[7],                   # stop_button
+            result[8]                    # run_button
+        ]
     else:
         try:
             _global_agent_state.clear_stop()
@@ -540,8 +558,9 @@ async def run_with_stream(
             # Initialize values for streaming
             html_content = f"<h1 style='width:{stream_vw}vw; height:{stream_vh}vh'>Using browser...</h1>"
             final_result = errors = model_actions = model_thoughts = ""
-            latest_videos = trace = history_file = None
-
+            recording_display = trace_file = agent_history_file = None
+            stop_button = gr.update(value="Stop", interactive=True)
+            run_button = gr.update(interactive=True)
 
             # Periodically update the stream while the agent task is running
             while not agent_task.done():
@@ -561,9 +580,9 @@ async def run_with_stream(
                         errors,
                         model_actions,
                         model_thoughts,
-                        latest_videos,
-                        trace,
-                        history_file,
+                        recording_display,
+                        trace_file,
+                        agent_history_file,
                         gr.update(value="Stopping...", interactive=False),  # stop_button
                         gr.update(interactive=False),  # run_button
                     ]
@@ -575,18 +594,26 @@ async def run_with_stream(
                         errors,
                         model_actions,
                         model_thoughts,
-                        latest_videos,
-                        trace,
-                        history_file,
-                        gr.update(value="Stop", interactive=True),  # Re-enable stop button
-                        gr.update(interactive=True)  # Re-enable run button
+                        recording_display,
+                        trace_file,
+                        agent_history_file,
+                        stop_button,
+                        run_button
                     ]
                 await asyncio.sleep(0.05)
 
             # Once the agent task completes, get the results
             try:
                 result = await agent_task
-                final_result, errors, model_actions, model_thoughts, latest_videos, trace, history_file, stop_button, run_button = result
+                final_result = result[0]
+                errors = result[1]
+                model_actions = result[2]
+                model_thoughts = result[3]
+                recording_display = result[4]
+                trace_file = result[5]
+                agent_history_file = result[6]
+                stop_button = result[7]
+                run_button = result[8]
             except Exception as e:
                 errors = f"Agent error: {str(e)}"
 
@@ -596,9 +623,9 @@ async def run_with_stream(
                 errors,
                 model_actions,
                 model_thoughts,
-                latest_videos,
-                trace,
-                history_file,
+                recording_display,
+                trace_file,
+                agent_history_file,
                 stop_button,
                 run_button
             ]
@@ -614,8 +641,8 @@ async def run_with_stream(
                 None,
                 None,
                 None,
-                gr.update(value="Stop", interactive=True),  # Re-enable stop button
-                gr.update(interactive=True)    # Re-enable run button
+                gr.update(value="Stop", interactive=True),  # stop_button
+                gr.update(interactive=True)    # run_button
             ]
 
 # Define the theme map globally
@@ -1058,7 +1085,7 @@ def create_ui(config, theme_name="Ocean"):
 
                     async def on_start_recording(task_name):
                         global _global_browser_context, _global_task_recorder
-                        
+                        assert _global_task_recorder is not None, "Task recorder is not initialized"
                         if not task_name.strip():
                             return {
                                 recording_status: "Error: Please enter a task name first",
@@ -1066,7 +1093,6 @@ def create_ui(config, theme_name="Ocean"):
                                 stop_recording_btn: gr.update(visible=False),
                                 recorded_steps: []
                             }
-                        
                         if not _global_browser_context:
                             return {
                                 recording_status: "Error: Browser not initialized. Please start the browser first.",
@@ -1074,12 +1100,9 @@ def create_ui(config, theme_name="Ocean"):
                                 stop_recording_btn: gr.update(visible=False),
                                 recorded_steps: []
                             }
-
                         try:
                             _global_task_recorder.start_recording(task_name)
-                            # Attach event handlers to browser context
-                            asyncio.create_task(_global_task_recorder.attach_to_browser(_global_browser_context))
-                            
+                            asyncio.create_task(_global_task_recorder.attach_to_browser(_global_browser_context))  # type: ignore
                             return {
                                 recording_status: "Recording started...",
                                 start_recording_btn: gr.update(visible=False),
@@ -1096,12 +1119,10 @@ def create_ui(config, theme_name="Ocean"):
 
                     async def on_stop_recording():
                         global _global_task_recorder
-                        
+                        assert _global_task_recorder is not None, "Task recorder is not initialized"
                         try:
-                            steps = _global_task_recorder.stop_recording()
-                            filepath = _global_task_recorder.save_recording()
-                            
-                            # After saving the recording, update both dropdowns
+                            steps = _global_task_recorder.stop_recording()  # type: ignore
+                            filepath = _global_task_recorder.save_recording()  # type: ignore
                             tasks = get_saved_tasks()
                             return {
                                 recording_status: "Recording stopped and saved",

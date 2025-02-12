@@ -189,4 +189,6 @@ data/
 .config.pkl
 
 **/## SpecStory.md
+.specstory/
+
 

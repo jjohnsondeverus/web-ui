@@ -122,7 +122,7 @@ async def run_browser_agent(
         browser_config = BrowserConfig(
             headless=headless,
             disable_security=disable_security,
-            chrome_instance_path=os.getenv("CHROME_PATH") if use_own_browser else None
+            chrome_instance_path=os.getenv("CHROME_PATH") or None
         )
         
         # Set config before launching
@@ -277,17 +277,13 @@ async def run_org_agent(
         # Clear any previous stop request
         _global_agent_state.clear_stop()
 
-        extra_chromium_args = [f"--window-size={window_w},{window_h}"]
-        if use_own_browser:
-            chrome_path = os.getenv("CHROME_PATH", None)
-            if chrome_path == "":
-                chrome_path = None
-            chrome_user_data = os.getenv("CHROME_USER_DATA", None)
-            if chrome_user_data:
-                extra_chromium_args += [f"--user-data-dir={chrome_user_data}"]
+        chrome_path = os.getenv("CHROME_PATH") or None
+        chrome_user_data = os.getenv("CHROME_USER_DATA") or None
+        if chrome_user_data:
+            extra_chromium_args = [f"--user-data-dir={chrome_user_data}"]
         else:
-            chrome_path = None
-            
+            extra_chromium_args = []
+        
         if _global_browser is None:
             _global_browser = Browser(
                 config=BrowserConfig(
@@ -372,16 +368,12 @@ async def run_custom_agent(
         # Clear any previous stop request
         _global_agent_state.clear_stop()
 
-        extra_chromium_args = [f"--window-size={window_w},{window_h}"]
-        if use_own_browser:
-            chrome_path = os.getenv("CHROME_PATH", None)
-            if chrome_path == "":
-                chrome_path = None
-            chrome_user_data = os.getenv("CHROME_USER_DATA", None)
-            if chrome_user_data:
-                extra_chromium_args += [f"--user-data-dir={chrome_user_data}"]
+        chrome_path = os.getenv("CHROME_PATH") or None
+        chrome_user_data = os.getenv("CHROME_USER_DATA") or None
+        if chrome_user_data:
+            extra_chromium_args = [f"--user-data-dir={chrome_user_data}"]
         else:
-            chrome_path = None
+            extra_chromium_args = []
 
         controller = CustomController()
 
@@ -657,7 +649,7 @@ theme_map = {
     "Base": Base()
 }
 
-async def close_global_browser():
+async def close_global_browser() -> None:
     """Ensure proper cleanup of browser resources"""
     global _global_browser, _global_browser_context, _global_playwright
     
@@ -666,14 +658,20 @@ async def close_global_browser():
             try:
                 await _global_browser_context.close()
             except Exception as e:
-                logger.error(f"Error closing browser context: {e}")
+                if "has been closed" in str(e):
+                    logger.warning(f"Browser context already closed: {e}")
+                else:
+                    logger.error(f"Error closing browser context: {e}")
             _global_browser_context = None
 
         if _global_browser:
             try:
                 await _global_browser.close()
             except Exception as e:
-                logger.error(f"Error closing browser: {e}")
+                if "has been closed" in str(e):
+                    logger.warning(f"Browser already closed: {e}")
+                else:
+                    logger.error(f"Error closing browser: {e}")
             _global_browser = None
             
         if _global_playwright:
@@ -691,24 +689,42 @@ async def initialize_browser_for_recording(use_own_browser: bool) -> str:
     global _global_browser, _global_browser_context, _global_playwright
     
     try:
-        # If browser exists but was created with different settings, close it
-        if _global_browser:
+        logger.info(f"initialize_browser_for_recording: use_own_browser = {use_own_browser}")
+        window_w = 1280  # default width
+        window_h = 720   # default height
+
+        # If not using own browser and a browser exists, close it; if using own browser and browser exists, reuse it.
+        if not use_own_browser and _global_browser:
+            logger.debug("Not using own browser; closing existing browser")
             await close_global_browser()
-            
-        # Setup browser with recording-appropriate settings
-        window_w = 1280  # Default width
-        window_h = 720   # Default height
+        elif use_own_browser and _global_browser:
+            logger.debug("Using own browser and browser already initialized")
+            return "Browser already initialized"
         
         # Setup browser config
         extra_chromium_args = []
         if use_own_browser:
-            chrome_path = os.getenv("CHROME_PATH", None)
-            if chrome_path == "":
-                chrome_path = None
-            chrome_user_data = os.getenv("CHROME_USER_DATA", None)
-            if chrome_user_data:
+            let_chrome_path = os.environ.get("CHROME_PATH")
+            logger.info(f"Raw CHROME_PATH from os.environ: {let_chrome_path}")
+            # Remove any surrounding whitespace and quotes
+            chrome_path = os.environ.get("CHROME_PATH", "").strip().strip('"')
+            if not chrome_path:
+                logger.error("CHROME_PATH is empty or not provided while 'Use Own Browser' is enabled")
+            else:
+                logger.info(f"Using CHROME_PATH: {chrome_path}")
+            chrome_user_data = os.environ.get("CHROME_USER_DATA", None)
+            logger.info(f"Using own browser: CHROME_PATH from env = {chrome_path}, CHROME_USER_DATA = {chrome_user_data}")
+            # Check if persistent session is enabled
+            persistent = os.environ.get("CHROME_PERSISTENT_SESSION", "false").lower() == "true"
+            if persistent and chrome_user_data:
+                # Use a dedicated agent profile folder inside the provided CHROME_USER_DATA to avoid conflicts
+                agent_profile = os.path.join(chrome_user_data, "BrowserUseProfile")
+                logger.info(f"Persistent session enabled. Using agent profile at: {agent_profile}")
+                extra_chromium_args.append(f"--user-data-dir={agent_profile}")
+            elif chrome_user_data:
                 extra_chromium_args.append(f"--user-data-dir={chrome_user_data}")
             extra_chromium_args.append(f"--window-size={window_w},{window_h}")
+            logger.info(f"Extra Chromium args: {extra_chromium_args}")
         
         browser_config = BrowserConfig(
             headless=False,  # Always show browser for human interaction
@@ -716,12 +732,15 @@ async def initialize_browser_for_recording(use_own_browser: bool) -> str:
             chrome_instance_path=chrome_path if use_own_browser else None,
             extra_chromium_args=extra_chromium_args
         )
-
+        logger.info(f"Created BrowserConfig: chrome_instance_path={browser_config.chrome_instance_path}, extra_chromium_args={browser_config.extra_chromium_args}")
+        
         # Initialize Playwright
         _global_playwright = await async_playwright().start()
-        
+        logger.debug("Playwright started")
+
         # Create browser instance
         _global_browser = CustomBrowser(config=browser_config)
+        logger.debug("CustomBrowser instance created")
         
         # Create context with proper window size configuration
         context_config = BrowserContextConfig()
@@ -730,11 +749,12 @@ async def initialize_browser_for_recording(use_own_browser: bool) -> str:
             width=window_w,
             height=window_h
         )
-        
+        logger.debug(f"Creating browser context with window size: {window_w}x{window_h}")
         _global_browser_context = await _global_browser.new_context(config=context_config)
-
+        
         # Create initial page
-        await _global_browser_context.new_page()
+        page = await _global_browser_context.new_page()
+        logger.debug(f"Initial page created with URL: {page.url}")
         
         return "Browser initialized successfully"
         
@@ -1072,6 +1092,11 @@ def create_ui(config, theme_name="Ocean"):
                     async def on_init_browser():
                         # Get browser settings from config
                         use_own = config.get('use_own_browser', False)
+                        # Log the value for debugging
+                        import logging
+                        logging.getLogger(__name__).info(f"on_init_browser: use_own_browser from config = {use_own}")
+                        # Uncomment the following line to force 'use_own_browser' to True for testing:
+                        use_own = True
                         result = await initialize_browser_for_recording(use_own)
                         return {
                             recording_status: result,

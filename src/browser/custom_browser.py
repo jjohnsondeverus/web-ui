@@ -18,23 +18,34 @@ class CustomBrowser(Browser):
     def __init__(self, config: Optional[BrowserConfig] = None):
         super().__init__(config=config or BrowserConfig())
         self._browser: Optional[PlaywrightBrowser] = None
+        logger.info(f"CustomBrowser.__init__: Received config: {config}")
 
     async def new_context(
         self,
         config: BrowserContextConfig = BrowserContextConfig()
     ) -> CustomBrowserContext:
         if not self._browser:
-            # Initialize browser if not already done
-            playwright = await async_playwright().start()
-            self._browser = await playwright.chromium.launch(
-                headless=self.config.headless,
-                args=self.config.extra_chromium_args
-            )
-            
+            try:
+                from webui import _global_playwright
+            except ImportError:
+                _global_playwright = None
+            playwright = _global_playwright if _global_playwright is not None else await async_playwright().start()
+            logger.info(f"CustomBrowser.new_context: chrome_instance_path = {self.config.chrome_instance_path}")
+            if self.config.chrome_instance_path:
+                # Use the existing Chrome instance via remote debugging
+                self._browser = await self._setup_browser_with_instance(playwright)
+            else:
+                # Launch new Chromium instance
+                self._browser = await playwright.chromium.launch(
+                    headless=self.config.headless,
+                    args=self.config.extra_chromium_args
+                )
+        
         # Create the context with proper viewport settings
         context = CustomBrowserContext(browser=self, config=config)
         context._context = await self._browser.new_context(
-            viewport={'width': config.browser_window_size['width'], 'height': config.browser_window_size['height']} if config.browser_window_size else None
+            viewport={'width': config.browser_window_size['width'], 'height': config.browser_window_size['height']} 
+                    if config.browser_window_size else None
         )
         return context
 
@@ -48,21 +59,24 @@ class CustomBrowser(Browser):
         """Sets up and returns a Playwright Browser instance with anti-detection measures."""
         if not self.config.chrome_instance_path:
             raise ValueError('Chrome instance path is required')
+        logger.debug(f"_setup_browser_with_instance: chrome_instance_path = {self.config.chrome_instance_path}")
         import subprocess
         import requests
 
         try:
             # Check if browser is already running
             response = requests.get('http://localhost:9222/json/version', timeout=2)
+            logger.debug(f"Response status code from localhost:9222/json/version: {response.status_code}")
             if response.status_code == 200:
-                logger.info('Reusing existing Chrome instance')
+                logger.info('Reusing existing Chrome instance via CDP')
                 self._browser = await playwright.chromium.connect_over_cdp(
                     endpoint_url='http://localhost:9222',
-                    timeout=20000,  # 20 second timeout for connection
+                    timeout=20000  
                 )
+                logger.debug('Successfully connected to Chrome via CDP')
                 return self._browser
         except requests.ConnectionError:
-            logger.debug('No existing Chrome instance found, starting a new one')
+            logger.debug('No existing Chrome instance found, will start a new instance')
 
         # Start a new Chrome instance
         subprocess.Popen(
